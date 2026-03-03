@@ -1,0 +1,59 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build winmm.dll
+        shell: msys2 {0}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          SRC_DIR=src
+          OUTPUT=winmm.dll
+          CFLAGS="-O2 -Wall -DNDEBUG -Wno-unused-variable"
+
+          g++ $CFLAGS -I$SRC_DIR -c $SRC_DIR/main.cpp -o main.o
+          g++ $CFLAGS -c $SRC_DIR/exports.cpp -o exports.o
+          g++ -c $SRC_DIR/stubs.S -o stubs.o
+          g++ -shared -static -s -o $OUTPUT main.o exports.o stubs.o -lkernel32 -luser32
+
+          ls -lh $OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            winmm.dll
+            antigravity_debug.ini
+          body: |
+            ## 安装方法
+
+            1. 下载 `winmm.dll`
+            2. 将 `winmm.dll` 复制到 Antigravity 安装目录：
+               ```
+               C:\Users\<用户名>\AppData\Local\Programs\Antigravity\
+               ```
+            3. 启动 Antigravity
+            4. 浏览器访问 `http://localhost:9222` 验证调试页面列表
+
+            如需自定义端口，同时下载 `antigravity_debug.ini` 并按需修改后放入同一目录。
+
+            详细说明请参阅 [README](https://github.com/${{ github.repository }}/blob/main/README.md)。
