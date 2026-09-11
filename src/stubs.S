@@ -16,7 +16,38 @@
 \name:
     mov rax, qword ptr [rip + fp_\name]
     test rax, rax
+    jnz 1f
+
+    # 保护调用约定的寄存器 (rcx, rdx, r8, r9 和 xmm0-xmm3)
+    push rcx
+    push rdx
+    push r8
+    push r9
+    # 分配栈空间给 xmm 寄存器，保持 16 字节对齐
+    sub rsp, 104
+    movdqu [rsp+32], xmm0
+    movdqu [rsp+48], xmm1
+    movdqu [rsp+64], xmm2
+    movdqu [rsp+80], xmm3
+
+    call LazyInitialize
+
+    # 恢复寄存器
+    movdqu xmm0, [rsp+32]
+    movdqu xmm1, [rsp+48]
+    movdqu xmm2, [rsp+64]
+    movdqu xmm3, [rsp+80]
+    add rsp, 104
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+
+    # 再次尝试加载函数指针
+    mov rax, qword ptr [rip + fp_\name]
+    test rax, rax
     jz .L\name\()_null
+1:
     jmp rax
 .L\name\()_null:
     xor eax, eax

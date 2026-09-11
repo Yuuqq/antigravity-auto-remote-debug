@@ -221,8 +221,18 @@ DECL_FP(mmsystemGetVersion)
 
 #define INIT_FP(name) fp_##name = GetProcAddress(g_hWinmmOriginal, #name)
 
-extern "C" BOOL InitializeForwarding(void) {
-    if (g_hWinmmOriginal) return TRUE;
+// 0: Uninitialized, 1: Initializing, 2: Initialized
+static long g_initializedForwarding = 0;
+
+extern "C" void LazyInitialize(void) {
+    // Try to become the initializing thread
+    if (InterlockedCompareExchange(&g_initializedForwarding, 1, 0) != 0) {
+        // If another thread is initializing, wait until it finishes
+        while (InterlockedCompareExchange(&g_initializedForwarding, 2, 2) != 2) {
+            Sleep(0);
+        }
+        return;
+    }
     
     // 获取系统目录
     wchar_t systemDir[MAX_PATH];
@@ -234,7 +244,11 @@ extern "C" BOOL InitializeForwarding(void) {
     
     // 加载系统原版 winmm.dll
     g_hWinmmOriginal = LoadLibraryW(winmmPath);
-    if (!g_hWinmmOriginal) return FALSE;
+    if (!g_hWinmmOriginal) {
+        // Init failed, set status to initialized so waiters don't deadlock
+        InterlockedExchange(&g_initializedForwarding, 2);
+        return;
+    }
     
     // 初始化所有函数指针
     INIT_FP(PlaySoundA);
@@ -410,6 +424,13 @@ extern "C" BOOL InitializeForwarding(void) {
     INIT_FP(sndPlaySoundW);
     INIT_FP(mmsystemGetVersion);
     
+    // Mark initialization complete
+    InterlockedExchange(&g_initializedForwarding, 2);
+}
+
+extern "C" BOOL InitializeForwarding(void) {
+    // This function is kept for backward compatibility if called from elsewhere,
+    // but the actual initialization is deferred to LazyInitialize.
     return TRUE;
 }
 
