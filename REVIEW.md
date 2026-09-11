@@ -14,17 +14,19 @@ Below are the findings categorized by severity.
 
 ## CRITICAL
 
-### 1. Thread-Unsafe Hooking Mechanism
+### 1. Thread-Unsafe Hooking Mechanism & Instruction Boundary Violation
 **File:** `src/main.cpp` (Functions: `CallOriginalGetCommandLineW`, `HookedGetCommandLineW`)
-**Impact:** Modifying memory via `VirtualProtect` and writing the trampoline bytes *back and forth* inside the hook function (`CallOriginalGetCommandLineW`) is extremely dangerous in a multi-threaded environment. If Thread A calls `GetCommandLineW` and temporarily restores the original bytes, Thread B calling `GetCommandLineW` at the exact same time will bypass the hook or execute a partially written instruction (leading to an immediate access violation/crash).
+**Impact:** Modifying memory via `VirtualProtect` and writing the trampoline bytes *back and forth* inside the hook function (`CallOriginalGetCommandLineW`) is extremely dangerous in a multi-threaded environment. Furthermore, blindly overwriting 14 bytes for the trampoline (`jmp [rip+0]`) can cross instruction boundaries. Modern `GetCommandLineW` implementations can be as small as 8 bytes, meaning a 14-byte overwrite will corrupt adjacent functions (such as `GetCommandLineA`).
 **Fix Suggestion:**
-Instead of unhooking and rehooking to call the original function, write a proper "trampoline" function during initialization. The trampoline should contain the saved original bytes (14 bytes) followed by a jump back to `OriginalFunction + 14`. The hook function should call this trampoline instead of temporarily unhooking the original function. Alternatively, consider using a minimal hooking library like MinHook, despite the goal of having zero dependencies, to ensure thread-safe hooking.
+Instead of using a naive 14-byte trampoline that overwrites adjacent code, either:
+1. Use a 5-byte relative jump (`jmp rel32`) to a nearby trampoline allocated via `VirtualAlloc` (within +/- 2GB of `kernel32.dll`), OR
+2. Modify the command line at the Process Environment Block (PEB) level (`PEB->ProcessParameters->CommandLine`) during initialization, completely avoiding the need for instruction patching.
 
 ### 2. Loader Lock Deadlock Risk
 **File:** `src/main.cpp` (Function: `DllMain`)
-**Impact:** `DllMain` does heavy lifting during `DLL_PROCESS_ATTACH`, including calling `LoadConfiguration` which internally calls `GetPrivateProfileIntW`. Calling APIs like `GetPrivateProfileIntW` from within `DllMain` is generally unsafe and can lead to deadlocks because it violates Microsoft's guidelines regarding the OS Loader Lock.
+**Impact:** `DllMain` calls `InitializeForwarding()`, which uses `LoadLibraryW` to load the system's `winmm.dll`. Calling `LoadLibraryW` from within `DllMain` can lead to a deadlock due to the OS Loader Lock. While `GetPrivateProfileIntW` is also called, the primary deadlock risk here comes from explicitly loading another DLL during `DLL_PROCESS_ATTACH`.
 **Fix Suggestion:**
-Defer configuration loading and hook installation. You can load configuration and install the hook the *first* time `GetCommandLineW` is called, or by spawning a separate initialization thread using `CreateThread` inside `DllMain`. Alternatively, read the configuration manually using lower-level APIs (like reading the file into a buffer and parsing it) to avoid `GetPrivateProfile*` during `DllMain`.
+Defer the loading of the system `winmm.dll`. Initialize it lazily on the first invocation of any forwarded function, ensuring `LoadLibraryW` is only called outside of `DllMain` (e.g., when the host application actually calls a `winmm.dll` function).
 
 ---
 
@@ -47,13 +49,14 @@ if (currentLen + appendLen < 32767) {
 **File:** `src/main.cpp` (Global variable: `g_commandLineModified`)
 **Impact:** `g_commandLineModified` is a static boolean used to prevent re-modifying the command line. If multiple threads call `GetCommandLineW` concurrently for the first time, both threads might bypass the `if (g_commandLineModified)` check, perform the string manipulations concurrently, and both attempt to write to the global `g_modifiedCommandLine` buffer at the same time, leading to string corruption.
 **Fix Suggestion:**
-Use synchronization (e.g., `std::call_once`, an atomic flag with a spinlock, or `EnterCriticalSection`) around the command-line modification block.
+Use synchronization around the command-line modification block. If using `InterlockedCompareExchange`, ensure there is a proper fallback/loser path (e.g., a spin-wait loop) so other threads do not return an uninitialized buffer while the winning thread is still setting it up. Alternatively, move the command line modification into `DllMain` (if using PEB modification), where concurrency is naturally avoided.
 ```cpp
 static long g_initialized = 0;
-if (InterlockedCompareExchange(&g_initialized, 1, 0) == 0) {
-    // Perform initialization and string manipulation
-    g_commandLineModified = TRUE;
+while (InterlockedCompareExchange(&g_initialized, 1, 0) != 0) {
+    Sleep(0); // Loser thread waits
 }
+// Perform initialization and string manipulation
+g_commandLineModified = TRUE;
 ```
 
 ---
@@ -66,11 +69,11 @@ if (InterlockedCompareExchange(&g_initialized, 1, 0) == 0) {
 **Fix Suggestion:**
 Instead of a simple substring search `wcsstr`, consider parsing the command line properly (e.g., using `CommandLineToArgvW`) or searching specifically for the `--type=` switch in a robust manner.
 
-### 2. Missing Absolute Path for System DLL
+### 2. Missing Error Handling for GetProcAddress
 **File:** `src/exports.cpp` (Function: `InitializeForwarding`)
-**Impact:** The code builds the path to the system `winmm.dll` using `GetSystemDirectoryW`. While this is secure against DLL hijacking, it dynamically resolves function pointers for every exported winmm function. A failure to load `winmm.dll` returns `FALSE` in `DllMain`, causing the host process to fail to start.
+**Impact:** The code builds the path to the system `winmm.dll` and dynamically resolves function pointers for every exported winmm function. However, failures from `GetProcAddress` are silently ignored, leaving function pointers as `NULL`. If a function happens to be missing or fails to resolve, a crash will occur when the stub attempts to jump to the `NULL` pointer.
 **Fix Suggestion:**
-Ensure fallback mechanisms or error logging exist if `winmm.dll` loading fails. Returning `FALSE` on `DLL_PROCESS_ATTACH` is correct but failing silently provides a poor debugging experience if things go wrong.
+Ensure fallback mechanisms or error logging exist if `winmm.dll` loading or `GetProcAddress` fails. Update the stubs to handle `NULL` function pointers gracefully (e.g., by returning an error code).
 
 ---
 
